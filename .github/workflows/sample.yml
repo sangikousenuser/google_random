@@ -1,0 +1,44 @@
+name: Google random sampling
+on:
+  workflow_dispatch:
+    inputs:
+      samples:
+        description: 'Sample count (first try 20, then 10000)'
+        default: '20'
+        required: true
+      delay_ms:
+        description: 'Minimum wait after each click (milliseconds)'
+        default: '1200'
+        required: true
+permissions:
+  contents: read
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      MPLCONFIGDIR: /tmp/matplotlib
+      SAMPLES: ${{ inputs.samples }}
+      DELAY_MS: ${{ inputs.delay_ms }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Collect actual Google widget outputs
+        run: python collect.py --samples "$SAMPLES" --delay-ms "$DELAY_MS"
+      - name: Analyze collected outputs
+        if: always()
+        run: |
+          if test -f results/samples.csv; then
+            python analyze.py results/samples.csv --expected "$SAMPLES"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: google-random-results
+          path: results/
+          if-no-files-found: warn
