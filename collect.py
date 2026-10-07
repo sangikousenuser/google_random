@@ -3,12 +3,31 @@ import argparse
 import csv
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
 URL = 'https://www.google.com/search?q=random+number+generator&hl=en'
+
+
+def check_access(page):
+    text = page.locator('body').inner_text(timeout=5000).lower()
+    if '/sorry/' in page.url or 'unusual traffic' in text:
+        raise RuntimeError('Google blocked automated access (unusual traffic/CAPTCHA). '
+                           'See failure.png; try running locally with --headed.')
+
+
+def find_generate_button(page):
+    # Google can change internal IDs while retaining the visible button name.
+    candidates = page.locator('#rng-button').or_(
+        page.get_by_role('button', name=re.compile(r'^(generate|生成)$', re.I))
+    ).filter(visible=True)
+    candidates.first.wait_for(state='visible', timeout=30000)
+    if candidates.count() != 1:
+        raise RuntimeError('Multiple generation buttons found; refusing ambiguous sampling')
+    return candidates
 
 
 def main():
@@ -31,18 +50,18 @@ def main():
         browser = p.chromium.launch(**launch)
         page = browser.new_page(locale='en-US')
         try:
-            page.goto(URL, wait_until='domcontentloaded', timeout=60000)
+            response = page.goto(URL, wait_until='domcontentloaded', timeout=60000)
+            metadata['http_status'] = response.status if response else None
             for label in ['Reject all', 'Accept all']:
                 consent = page.get_by_role('button', name=label, exact=True)
                 if consent.count() and consent.first.is_visible():
                     consent.first.click()
                     break
-            # Fail if Google changes the UI; retain diagnostics rather than guess.
-            minimum = page.locator('#rng-min')
-            maximum = page.locator('#rng-max')
-            button = page.locator('#rng-button')
+            check_access(page)
+            minimum = page.locator('input#rng-min, #rng-min input')
+            maximum = page.locator('input#rng-max, #rng-max input')
+            button = find_generate_button(page)
             value = page.locator('#rng-value')
-            button.wait_for(state='visible', timeout=30000)
 
             def bounds(low, high):
                 # Set maximum first so increasing the minimum cannot cross it.
@@ -88,11 +107,20 @@ def main():
         except Exception as exc:
             metadata['status'] = 'failed'
             metadata['error'] = str(exc)
-            try:
-                page.screenshot(path=str(output / 'failure.png'), full_page=True)
-                (output / 'failure.html').write_text(page.content())
-            except Exception:
-                pass
+            metadata['page_url'] = page.url
+            # Save diagnostics independently: a failed screenshot must not hide text.
+            diagnostics = [
+                lambda: page.screenshot(path=str(output / 'failure.png'), full_page=True),
+                lambda: (output / 'failure.html').write_text(page.content()),
+                lambda: (output / 'failure.txt').write_text(
+                    page.locator('body').inner_text(timeout=5000)),
+            ]
+            for save in diagnostics:
+                try:
+                    save()
+                except Exception as diagnostic_error:
+                    print(f'Diagnostic capture failed: {diagnostic_error}', flush=True)
+            print(f'Collection failed at {page.url}: {exc}', flush=True)
             raise
         finally:
             metadata['finished'] = datetime.now(timezone.utc).isoformat()
